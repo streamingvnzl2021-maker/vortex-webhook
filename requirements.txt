@@ -1,4 +1,5 @@
 flask
+flask-corn
 requests
 python-dotenv
 gunicorn
