@@ -13,6 +13,11 @@ CORS(app) # Habilita comunicación segura con Google AI Studio
 app.register_blueprint(webhook_bp)
 app.register_blueprint(c2p_bp)
 
+# Ventanilla exclusiva para mantener el servidor despierto 24/7
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({"status": "active", "message": "Servidor despierto"}), 200
+
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
