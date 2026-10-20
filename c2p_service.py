@@ -20,8 +20,8 @@ def solicitar_intencion():
     
     # Formateo inteligente del teléfono (remueve el 0 y antepone 58)
     telefono_raw = str(datos.get("debtorCellPhone", "")).strip()
-    telefono_limpio = telefono_raw[1:] if telefono_raw.startswith("0") else telefono_raw
-    phone_formatted = f"58{telefono_limpio}"
+    telefono_limpio = "".join(filter(str.isdigit, telefono_raw))
+    phone_formatted = telefono_limpio if telefono_limpio.startswith("58") else f"58{telefono_limpio.lstrip('0')}"
 
     # Formateo de Cédula (Ej. V12345678)
     tipo_doc = str(datos.get("docType", "V")).upper()
