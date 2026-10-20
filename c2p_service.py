@@ -49,9 +49,9 @@ def solicitar_intencion():
 def ejecutar_cobro():
     datos = request.get_json() or {}
     
-telefono_raw = str(datos.get("debtorCellPhone", "")).strip()
-telefono_limpio = "".join(filter(str.isdigit, telefono_raw))
-phone_formatted = telefono_limpio if telefono_limpio.startswith("58") else f"58{telefono_limpio.lstrip('0')}"
+    telefono_raw = str(datos.get("debtorCellPhone", "")).strip()
+    telefono_limpio = "".join(filter(str.isdigit, telefono_raw))
+    phone_formatted = telefono_limpio if telefono_limpio.startswith("58") else f"58{telefono_limpio.lstrip('0')}"
 
     tipo_doc = str(datos.get("docType", "V")).upper()
     num_doc = str(datos.get("docNumber", "")).strip()
