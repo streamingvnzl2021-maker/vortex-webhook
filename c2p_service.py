@@ -1,5 +1,9 @@
 import os
 import requests
+import random
+import smtplib
+from email.mine.text import MINEText
+from email.mine.multipart import MIMEMultipar
 from flask import Blueprint, request, jsonify
 from dotenv import load_dotenv
 
@@ -118,6 +122,7 @@ def obtener_tasa_vexpay():
     except Exception as e:
         return jsonify({"status": "error", "message": "Error al obtener tasa de Vex Pay"}), 500
 
+
 # Entorno Encargado de Verificacion con "OTP" por Correo a los Usuarios.
 import random
 import smtplib
@@ -196,11 +201,7 @@ def verificar_codigo_correo():
     
     # Si coincide, eliminamos el código usado por seguridad
     del VERIFICATION_CODES[email]
-    return jsonify({"status": "success", "message": "Correo verificado exitosamente"}), 200import random
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import os
+    return jsonify({"status": "success", "message": "Correo verificado exitosamente"}), 200
 
 # Memoria temporal para almacenar los códigos de verificación (Email -> {"code": "123456", "expires": timestamp})
 VERIFICATION_CODES = {}
