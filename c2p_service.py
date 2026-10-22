@@ -106,3 +106,14 @@ def verificar_pago_movil():
         return jsonify(response.json()), response.status_code
     except Exception as e:
         return jsonify({"status": "error", "message": "Error de conexión con la pasarela"}), 500
+
+
+# RUTA 5: Obtener tasa oficial del dolar directamente desde Vex Pay
+@c2p_bp.route('/api/quote', methods=['GET'])
+def obtener_tasa_vexpay():
+    url = "https://api.pay.vexwallet.co/v1/quote?usdAmount=1"
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Error al obtener tasa de Vex Pay"}), 500
