@@ -2,8 +2,8 @@ import os
 import requests
 import random
 import smtplib
-from email.mine.text import MINEText
-from email.mine.multipart import MIMEMultipar
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from flask import Blueprint, request, jsonify
 from dotenv import load_dotenv
 
