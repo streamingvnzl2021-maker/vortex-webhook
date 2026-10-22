@@ -73,3 +73,36 @@ def ejecutar_cobro():
         return jsonify(response.json()), response.status_code
     except Exception as e:
         return jsonify({"status": "error", "message": "Error de conexión con la pasarela"}), 500
+
+
+# RUTA 3: Obtener datos de la cuenta receptora de Pago Movil
+@c2p_bp.route('/api/pago-movil/account', methods=['GET'])
+def obtener_cuenta_pago_movil():
+    url = "https://api.pay.vexwallet.co/v1/payments/pago-movil/receiving-account"
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Error al obtener cuenta receptora"}), 500
+
+
+# RUTA 4: Verificar la transferencia de Pago Movil por referencia
+@c2p_bp.route('/api/pago-movil/verify', methods=['POST'])
+def verificar_pago_movil():
+    datos = request.get_json() or {}
+
+    payload = {
+        "usdAmount": float(datos.get("usdAmount", 0)),
+        "reference": str(datos.get("reference", "")).strip(),
+        "externalRef": datos.get("externalRef")
+    }
+
+    if datos.get("dateMovement"):
+        payload["dateMovement"] = str(datos.get("dateMovement")).strip()
+
+    url = "https://api.pay.vexwallet.co/v1/payments/pago-movil/verify"
+    try:
+        response = requests.post(url, json=payload, headers=HEADERS, timeout=15)
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Error de conexión con la pasarela"}), 500
