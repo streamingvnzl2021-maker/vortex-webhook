@@ -216,3 +216,36 @@ def enviar_codigo_correo():
     except Exception as e:
         print(f"[ERROR GENERAL] {str(e)}", flush=True)
         return jsonify({"status": "error", "message": "Error interno al enviar el correo"}), 500
+
+
+# RUTA: Verificar el código de 6 dígitos introducido por el usuario
+@c2p_bp.route('/api/auth/verify-code', methods=['POST', 'OPTIONS'])
+def verificar_codigo_correo():
+    # Respuesta a la verificación previa del navegador (CORS Preflight)
+    if request.method == 'OPTIONS':
+        response = jsonify({"status": "ok"})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+        response.headers.add("Access-Control-Allow-Methods", "POST,OPTIONS")
+        return response, 200
+
+    datos = request.get_json(silent=True) or {}
+    email = str(datos.get("email", "")).strip().lower()
+    user_code = str(datos.get("code", "")).strip()
+
+    print(f"\n[AUTH VERIFY] Solicitud para: '{email}' | Código ingresado: '{user_code}'", flush=True)
+
+    saved_code = VERIFICATION_CODES.get(email)
+    print(f"[AUTH VERIFY] Código real almacenado en memoria: '{saved_code}'\n", flush=True)
+
+    if not saved_code or str(saved_code).strip() != user_code:
+        resp = jsonify({"status": "error", "message": "Código incorrecto o expirado"})
+        resp.headers.add("Access-Control-Allow-Origin", "*")
+        return resp, 400
+
+    # Si el código es correcto, se borra de la memoria para evitar que se use dos veces
+    del VERIFICATION_CODES[email]
+
+    resp = jsonify({"status": "success", "message": "Correo verificado exitosamente"})
+    resp.headers.add("Access-Control-Allow-Origin", "*")
+    return resp, 200
