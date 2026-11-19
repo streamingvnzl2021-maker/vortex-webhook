@@ -4,6 +4,7 @@ from flask_cors import CORS
 
 from webhook_vexpay import webhook_bp
 from c2p_service import c2p_bp
+from biyuyo_c2p_service import biyuyo_c2p_bp
 
 app = Flask(__name__)
 CORS(app)  # Habilita la comunicación con AI Studio
@@ -11,6 +12,7 @@ CORS(app)  # Habilita la comunicación con AI Studio
 # Registramos tus módulos
 app.register_blueprint(webhook_bp)
 app.register_blueprint(c2p_bp)
+app.register_blueprint(biyuyo_c2p_bp)
 
 # Ruta ultra-simple para mantener despierto el servidor
 @app.route('/ping', methods=['GET'])
