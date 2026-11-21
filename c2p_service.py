@@ -76,7 +76,7 @@ def ejecutar_cobro():
 
     url = "https://api.pay.vexwallet.co/v1/payments/c2p"
     try:
-        response = requests.post(url, json=payload, headers=HEADERS, timeout=15)
+        response = requests.post(url, json=payload, headers=HEADERS, timeout=45)
         return jsonify(response.json()), response.status_code
     except Exception as e:
         return jsonify({"status": "error", "message": "Error de conexión con la pasarela"}), 500
@@ -87,7 +87,7 @@ def ejecutar_cobro():
 def obtener_cuenta_pago_movil():
     url = "https://api.pay.vexwallet.co/v1/payments/pago-movil/receiving-account"
     try:
-        response = requests.get(url, headers=HEADERS, timeout=15)
+        response = requests.get(url, headers=HEADERS, timeout=45)
         return jsonify(response.json()), response.status_code
     except Exception as e:
         return jsonify({"status": "error", "message": "Error al obtener cuenta receptora"}), 500
