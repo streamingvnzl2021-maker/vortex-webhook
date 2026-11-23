@@ -3,6 +3,25 @@ import requests
 from flask import Blueprint, request, jsonify
 from dotenv import load_dotenv
 
+from backend_core import (
+    VEXPAY_BASE_URL,
+    check_rate_limit,
+    get_client_ip,
+    get_venezuela_time_payload,
+    get_webhook_status,
+    is_bank_reference_consumed,
+    is_vexpay_approved,
+    normalize_bank_reference,
+    normalize_doc_id,
+    normalize_ve_phone,
+    parse_bank_code,
+    parse_positive_float,
+    parse_vexpay_response,
+    record_consumed_bank_reference,
+    validate_bank_otp,
+    validate_min_ves_for_one_usd,
+)
+
 load_dotenv()
 
 biyuyo_c2p_bp = Blueprint('biyuyo_c2p_service', __name__, url_prefix='/biyuyo')
@@ -11,142 +30,248 @@ biyuyo_c2p_bp = Blueprint('biyuyo_c2p_service', __name__, url_prefix='/biyuyo')
 def get_biyuyo_headers():
     api_key = os.getenv("VEXPAY_BIYUYO_API_KEY", "").strip()
     if not api_key:
-        return None
+        return None, None
     return {
         "x-api-key": api_key,
         "Content-Type": "application/json"
-    }
+    }, api_key
 
 
-def parse_vexpay_response(response):
-    try:
-        return jsonify(response.json()), response.status_code
-    except ValueError:
-        return jsonify({
-            "status": "error",
-            "message": response.text or "Respuesta no válida de la pasarela VexPay"
-        }), response.status_code
+def _is_valid_biyuyo_ref(external_ref) -> bool:
+    ref = str(external_ref or "").strip().upper()
+    return (ref.startswith("BYX-") or ref.startswith("RES-BYX-")) and len(ref) <= 80
 
 
-# RUTA 1: Crear la intención de pago C2P para Biyuyo Express
+# RUTA 1: Crear intención C2P (Biyuyo Express)
 @biyuyo_c2p_bp.route('/api/c2p/request', methods=['POST'])
 def biyuyo_solicitar_intencion():
-    headers = get_biyuyo_headers()
+    headers, api_key = get_biyuyo_headers()
     if not headers:
         return jsonify({"status": "error", "message": "VEXPAY_BIYUYO_API_KEY no configurada en Render"}), 500
 
+    ip = get_client_ip(request)
+    ok_rl, retry_after = check_rate_limit(f"byx_c2p_req:{ip}", max_hits=15, window_seconds=60)
+    if not ok_rl:
+        return jsonify({"status": "error", "message": f"Demasiadas solicitudes. Intenta en {retry_after}s."}), 429
+
     datos = request.get_json(silent=True) or {}
+    external_ref = str(datos.get("externalRef") or "").strip()
+    if not _is_valid_biyuyo_ref(external_ref):
+        return jsonify({"status": "error", "message": "Referencia inválida: Biyuyo Express exige prefijo BYX-"}), 400
 
-    telefono_raw = str(datos.get("debtorCellPhone", "")).strip()
-    telefono_limpio = "".join(filter(str.isdigit, telefono_raw))
-    phone_formatted = telefono_limpio if telefono_limpio.startswith("58") else f"58{telefono_limpio.lstrip('0')}"
+    ves_amount = parse_positive_float(datos.get("vesAmount"))
+    if ves_amount is None:
+        return jsonify({"status": "error", "message": "Monto en Bolívares inválido"}), 400
+    min_ok, min_msg = validate_min_ves_for_one_usd(ves_amount, api_key)
+    if not min_ok:
+        return jsonify({"status": "error", "message": min_msg}), 400
 
-    tipo_doc = str(datos.get("docType", "V")).upper()
-    num_doc = str(datos.get("docNumber", "")).strip()
-    debtor_id = f"{tipo_doc}{num_doc}"
+    phone_formatted = normalize_ve_phone(datos.get("debtorCellPhone"))
+    if not phone_formatted:
+        return jsonify({"status": "error", "message": "Teléfono móvil venezolano inválido (ej. 04141234567)"}), 400
+
+    debtor_id = normalize_doc_id(datos.get("docType", "V"), datos.get("docNumber"))
+    if not debtor_id:
+        return jsonify({"status": "error", "message": "Cédula o RIF inválido"}), 400
+
+    bank_code = parse_bank_code(datos.get("debtorBankCode"))
+    if bank_code is None:
+        return jsonify({"status": "error", "message": "Código de banco emisor inválido"}), 400
 
     payload = {
-        "vesAmount": float(datos.get("vesAmount", 0)),
+        "vesAmount": ves_amount,
         "debtorId": debtor_id,
         "debtorCellPhone": phone_formatted,
-        "debtorBankCode": int(datos.get("debtorBankCode", 102)),
-        "externalRef": datos.get("externalRef")
+        "debtorBankCode": bank_code,
+        "externalRef": external_ref
     }
 
-    url = "https://api.pay.vexwallet.co/v1/payments/c2p/request"
+    url = f"{VEXPAY_BASE_URL}/v1/payments/c2p/request"
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        response = requests.post(url, json=payload, headers=headers, timeout=45)
         return parse_vexpay_response(response)
-    except Exception:
-        return jsonify({"status": "error", "message": "Error de conexión con la pasarela Biyuyo"}), 500
+    except requests.Timeout:
+        return jsonify({"status": "error", "message": "Tiempo de espera agotado con el banco (45s). Tu reserva sigue protegida."}), 504
+    except requests.RequestException:
+        return jsonify({"status": "error", "message": "Error temporal de conexión con la pasarela Biyuyo"}), 502
 
 
-# RUTA 2: Ejecutar el cobro C2P con el Token OTP para Biyuyo Express
+# RUTA 2: Ejecutar cobro C2P con Token OTP (Biyuyo Express — timeout=45s + HTTP 504/502)
 @biyuyo_c2p_bp.route('/api/c2p/execute', methods=['POST'])
 def biyuyo_ejecutar_cobro():
-    headers = get_biyuyo_headers()
+    headers, api_key = get_biyuyo_headers()
     if not headers:
         return jsonify({"status": "error", "message": "VEXPAY_BIYUYO_API_KEY no configurada en Render"}), 500
 
+    ip = get_client_ip(request)
+    ok_rl, retry_after = check_rate_limit(f"byx_c2p_exec:{ip}", max_hits=15, window_seconds=60)
+    if not ok_rl:
+        return jsonify({"status": "error", "message": f"Demasiadas solicitudes. Intenta en {retry_after}s."}), 429
+
     datos = request.get_json(silent=True) or {}
+    external_ref = str(datos.get("externalRef") or "").strip()
+    intent_id = str(datos.get("intentId") or "").strip()
+    if not _is_valid_biyuyo_ref(external_ref) or not intent_id:
+        return jsonify({"status": "error", "message": "Faltan intentId o externalRef válido de Biyuyo (BYX-)"}), 400
 
-    telefono_raw = str(datos.get("debtorCellPhone", "")).strip()
-    telefono_limpio = "".join(filter(str.isdigit, telefono_raw))
-    phone_formatted = telefono_limpio if telefono_limpio.startswith("58") else f"58{telefono_limpio.lstrip('0')}"
+    ves_amount = parse_positive_float(datos.get("vesAmount"))
+    if ves_amount is None:
+        return jsonify({"status": "error", "message": "Monto en Bolívares inválido"}), 400
+    min_ok, min_msg = validate_min_ves_for_one_usd(ves_amount, api_key)
+    if not min_ok:
+        return jsonify({"status": "error", "message": min_msg}), 400
 
-    tipo_doc = str(datos.get("docType", "V")).upper()
-    num_doc = str(datos.get("docNumber", "")).strip()
-    debtor_id = f"{tipo_doc}{num_doc}"
+    phone_formatted = normalize_ve_phone(datos.get("debtorCellPhone"))
+    if not phone_formatted:
+        return jsonify({"status": "error", "message": "Teléfono móvil venezolano inválido"}), 400
+
+    debtor_id = normalize_doc_id(datos.get("docType", "V"), datos.get("docNumber"))
+    if not debtor_id:
+        return jsonify({"status": "error", "message": "Cédula o RIF inválido"}), 400
+
+    bank_code = parse_bank_code(datos.get("debtorBankCode"))
+    if bank_code is None:
+        return jsonify({"status": "error", "message": "Código de banco emisor inválido"}), 400
+
+    token = validate_bank_otp(datos.get("token"))
+    if not token:
+        return jsonify({"status": "error", "message": "Clave dinámica C2P/OTP inválida (6 a 8 dígitos)"}), 400
 
     payload = {
-        "intentId": datos.get("intentId"),
-        "vesAmount": float(datos.get("vesAmount", 0)),
+        "intentId": intent_id,
+        "vesAmount": ves_amount,
         "debtorId": debtor_id,
         "debtorCellPhone": phone_formatted,
-        "debtorBankCode": int(datos.get("debtorBankCode", 102)),
-        "token": str(datos.get("token", "")).strip(),
-        "externalRef": datos.get("externalRef")
+        "debtorBankCode": bank_code,
+        "token": token,
+        "externalRef": external_ref
     }
 
-    url = "https://api.pay.vexwallet.co/v1/payments/c2p"
+    url = f"{VEXPAY_BASE_URL}/v1/payments/c2p"
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        response = requests.post(url, json=payload, headers=headers, timeout=45)
+        try:
+            body = response.json()
+            if is_vexpay_approved(body, response.status_code):
+                nested = body.get("data") if isinstance(body.get("data"), dict) else body
+                bank_ref = nested.get("bankReference") or nested.get("reference")
+                if bank_ref:
+                    raw_r, canon_r = normalize_bank_reference(bank_ref)
+                    if canon_r:
+                        record_consumed_bank_reference(raw_r, canon_r, "biyuyo", external_ref, "C2P")
+        except ValueError:
+            pass
         return parse_vexpay_response(response)
-    except Exception:
-        return jsonify({"status": "error", "message": "Error de conexión con la pasarela Biyuyo"}), 500
+    except requests.Timeout:
+        return jsonify({"status": "error", "message": "El banco tardó más de 45s en responder. Tu reserva permanece protegida."}), 504
+    except requests.RequestException:
+        return jsonify({"status": "error", "message": "Error temporal de conexión con la pasarela Biyuyo"}), 502
 
 
-# RUTA 3: Obtener datos de la cuenta receptora de Pago Móvil para Biyuyo Express
+# RUTA 3: Cuenta receptora Pago Móvil (Biyuyo Express)
 @biyuyo_c2p_bp.route('/api/pago-movil/account', methods=['GET'])
 def biyuyo_obtener_cuenta_pago_movil():
-    headers = get_biyuyo_headers()
+    headers, _ = get_biyuyo_headers()
     if not headers:
         return jsonify({"status": "error", "message": "VEXPAY_BIYUYO_API_KEY no configurada en Render"}), 500
 
-    url = "https://api.pay.vexwallet.co/v1/payments/pago-movil/receiving-account"
+    url = f"{VEXPAY_BASE_URL}/v1/payments/pago-movil/receiving-account"
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(url, headers=headers, timeout=45)
         return parse_vexpay_response(response)
-    except Exception:
-        return jsonify({"status": "error", "message": "Error al obtener cuenta receptora Biyuyo"}), 500
+    except requests.Timeout:
+        return jsonify({"status": "error", "message": "Tiempo de espera agotado al obtener cuenta receptora Biyuyo"}), 504
+    except requests.RequestException:
+        return jsonify({"status": "error", "message": "Error al obtener cuenta receptora Biyuyo"}), 502
 
 
-# RUTA 4: Verificar transferencia de Pago Móvil por referencia para Biyuyo Express
+# RUTA 4: Verificar Pago Móvil (Biyuyo Express) + Anti-Replay Servidor
 @biyuyo_c2p_bp.route('/api/pago-movil/verify', methods=['POST'])
 def biyuyo_verificar_pago_movil():
-    headers = get_biyuyo_headers()
+    headers, _ = get_biyuyo_headers()
     if not headers:
         return jsonify({"status": "error", "message": "VEXPAY_BIYUYO_API_KEY no configurada en Render"}), 500
+
+    ip = get_client_ip(request)
+    ok_rl, retry_after = check_rate_limit(f"byx_pm_verify:{ip}", max_hits=20, window_seconds=60)
+    if not ok_rl:
+        return jsonify({"status": "error", "message": f"Demasiados intentos. Espera {retry_after}s."}), 429
 
     datos = request.get_json(silent=True) or {}
+    external_ref = str(datos.get("externalRef") or "").strip()
+    if not _is_valid_biyuyo_ref(external_ref):
+        return jsonify({"status": "error", "message": "Referencia inválida: Biyuyo Express exige prefijo BYX-"}), 400
+
+    usd_amount = parse_positive_float(datos.get("usdAmount"), min_val=1.0, max_val=10000.0)
+    if usd_amount is None:
+        return jsonify({"status": "error", "message": "El monto mínimo para Pago Móvil es $1.00 USD"}), 400
+
+    raw_ref, canonical_ref = normalize_bank_reference(datos.get("reference"))
+    if not raw_ref:
+        return jsonify({"status": "error", "message": "La referencia bancaria debe tener entre 6 y 12 dígitos numéricos"}), 400
+
+    already_used, prev = is_bank_reference_consumed(canonical_ref, external_ref)
+    if already_used:
+        return jsonify({
+            "status": "error",
+            "code": "REPLAY_ATTACK",
+            "message": f"Esta referencia bancaria ya fue acreditada previamente en {prev['game'].upper()}."
+        }), 409
 
     payload = {
-        "usdAmount": float(datos.get("usdAmount", 0)),
-        "reference": str(datos.get("reference", "")).strip(),
-        "externalRef": datos.get("externalRef")
+        "usdAmount": usd_amount,
+        "reference": raw_ref,
+        "externalRef": external_ref
     }
-
     if datos.get("dateMovement"):
-        payload["dateMovement"] = str(datos.get("dateMovement")).strip()
+        payload["dateMovement"] = str(datos.get("dateMovement")).strip()[:20]
 
-    url = "https://api.pay.vexwallet.co/v1/payments/pago-movil/verify"
+    url = f"{VEXPAY_BASE_URL}/v1/payments/pago-movil/verify"
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        response = requests.post(url, json=payload, headers=headers, timeout=45)
+        try:
+            body = response.json()
+            if is_vexpay_approved(body, response.status_code):
+                record_consumed_bank_reference(raw_ref, canonical_ref, "biyuyo", external_ref, "PAGO_MOVIL", usd_amount)
+        except ValueError:
+            pass
         return parse_vexpay_response(response)
-    except Exception:
-        return jsonify({"status": "error", "message": "Error de conexión con la pasarela Biyuyo"}), 500
+    except requests.Timeout:
+        return jsonify({"status": "error", "message": "Tiempo de espera agotado verificando Pago Móvil Biyuyo (45s)"}), 504
+    except requests.RequestException:
+        return jsonify({"status": "error", "message": "Error temporal de conexión con la pasarela Biyuyo"}), 502
 
 
-# RUTA 5: Obtener tasa oficial del dólar desde la llave de Biyuyo Express
+# RUTA 5: Tasa oficial BCV/VexPay (Biyuyo Express)
 @biyuyo_c2p_bp.route('/api/quote', methods=['GET'])
 def biyuyo_obtener_tasa_vexpay():
-    headers = get_biyuyo_headers()
+    headers, _ = get_biyuyo_headers()
     if not headers:
         return jsonify({"status": "error", "message": "VEXPAY_BIYUYO_API_KEY no configurada en Render"}), 500
 
-    url = "https://api.pay.vexwallet.co/v1/quote?usdAmount=1"
+    url = f"{VEXPAY_BASE_URL}/v1/quote?usdAmount=1"
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(url, headers=headers, timeout=20)
         return parse_vexpay_response(response)
-    except Exception:
-        return jsonify({"status": "error", "message": "Error al obtener tasa de VexPay Biyuyo"}), 500
+    except requests.Timeout:
+        return jsonify({"status": "error", "message": "Tiempo de espera agotado consultando tasa VexPay Biyuyo"}), 504
+    except requests.RequestException:
+        return jsonify({"status": "error", "message": "Error al obtener tasa de VexPay Biyuyo"}), 502
+
+
+# RUTA 6: Conciliación post-F5 de pagos Biyuyo registrados por webhook
+@biyuyo_c2p_bp.route('/api/c2p/status/<external_ref>', methods=['GET'])
+def consultar_estado_biyuyo(external_ref):
+    clean_ref = str(external_ref or "").strip()
+    if not _is_valid_biyuyo_ref(clean_ref):
+        return jsonify({"status": "error", "message": "Referencia de Biyuyo inválida"}), 400
+    record = get_webhook_status(clean_ref, expected_game="biyuyo")
+    if not record:
+        return jsonify({"status": "not_found", "externalRef": clean_ref}), 404
+    return jsonify({"status": "ok", "data": record}), 200
+
+
+# RUTA 7: Reloj oficial Venezuela (UTC-4) bajo el prefijo /biyuyo
+@biyuyo_c2p_bp.route('/api/time', methods=['GET'])
+def biyuyo_server_time():
+    return jsonify(get_venezuela_time_payload()), 200
