@@ -12,9 +12,10 @@ app = Flask(__name__)
 
 
 def build_allowed_origins():
-    """Restringe CORS a dominios oficiales + vistas previas seguras de AI Studio."""
+    """AG-BE-A4: Restringe CORS a dominios oficiales + vistas previas seguras de AI Studio."""
     origins = [
-        re.compile(r"^https://[a-zA-Z0-9-]+\.run\.app$"),
+        re.compile(r"^https://[a-zA-Z0-9.-]+\.run\.app$"),
+        re.compile(r"^https://[a-zA-Z0-9.-]+\.scf\.usercontent\.goog$"),
         "https://aistudio.google.com",
         "http://localhost:5173",
         "http://localhost:3000",
