@@ -1,6 +1,5 @@
 import hashlib
 import hmac
-import json
 import logging
 import math
 import os
@@ -34,9 +33,12 @@ REJECTED_STATUSES = {"FAILED", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED", "
 
 
 def _get_conn():
+    parent_dir = os.path.dirname(DB_PATH)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    # AG2-A10: busy_timeout SIEMPRE antes de cualquier operacion/PRAGMA
     conn.execute("PRAGMA busy_timeout=10000;")
     return conn
 
@@ -44,6 +46,8 @@ def _get_conn():
 def init_db():
     conn = _get_conn()
     try:
+        # AG2-A10: WAL se activa una sola vez en inicializacion despues de busy_timeout
+        conn.execute("PRAGMA journal_mode=WAL;")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS auth_otps (
                 email TEXT PRIMARY KEY,
@@ -77,11 +81,19 @@ def init_db():
             CREATE TABLE IF NOT EXISTS consumed_bank_references (
                 normalized_ref TEXT PRIMARY KEY,
                 raw_reference TEXT NOT NULL,
+                suffix6 TEXT NOT NULL DEFAULT '',
                 game TEXT NOT NULL,
                 external_ref TEXT NOT NULL,
                 method TEXT NOT NULL,
                 amount_usd REAL,
                 created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS inflight_bank_references (
+                lock_key TEXT PRIMARY KEY,
+                external_ref TEXT NOT NULL,
+                game TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS kv_cache (
@@ -90,6 +102,14 @@ def init_db():
                 expires_at INTEGER NOT NULL
             );
         """)
+        # Migracion segura para tablas previas sin columna suffix6
+        try:
+            conn.execute("ALTER TABLE consumed_bank_references ADD COLUMN suffix6 TEXT NOT NULL DEFAULT '';")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_consumed_suffix6 ON consumed_bank_references(suffix6);"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -121,9 +141,12 @@ def mask_email(email: str) -> str:
 
 
 def get_client_ip(req) -> str:
-    forwarded = req.headers.get("X-Forwarded-For", "")
+    """AG2-A10: Usa la IP mas a la derecha anadida por el proxy de Render (inmune a spoofing en [0])."""
+    forwarded = req.headers.get("X-Forwarded-For", "").strip()
     if forwarded:
-        return forwarded.split(",")[0].strip()[:64]
+        parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+        if parts:
+            return parts[-1][:64]
     return (req.remote_addr or "unknown")[:64]
 
 
@@ -205,11 +228,31 @@ def parse_bank_code(val):
 
 
 def normalize_bank_reference(raw_ref):
+    """Retorna (raw_digits, canonical_sin_ceros, suffix6_preservando_ceros)."""
     digits = "".join(filter(str.isdigit, str(raw_ref or "").strip()))
     if not BANK_REF_REGEX.match(digits):
-        return None, None
-    canonical = digits.lstrip("0") or digits
-    return digits, canonical
+        return None, None, None
+    canonical = digits.lstrip("0") or "0"
+    suffix6 = digits[-6:] if len(digits) >= 6 else ""
+    return digits, canonical, suffix6
+
+
+def extract_bank_reference_from_response(body):
+    """Extrae referencia bancaria desde raiz, data o payload cubriendo todas las variantes de VexPay."""
+    if not isinstance(body, dict):
+        return ""
+    candidates = []
+    for container_key in ("data", "payload", "payment"):
+        sub = body.get(container_key)
+        if isinstance(sub, dict):
+            candidates.append(sub)
+    candidates.append(body)
+    for src in candidates:
+        for key in ("bankReference", "bank_reference", "reference", "paymentReference", "refNumber"):
+            val = src.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    return ""
 
 
 def validate_bank_otp(raw_token) -> str:
@@ -257,6 +300,7 @@ def is_vexpay_approved(data, status_code: int) -> bool:
 
 def get_cached_vexpay_rate(api_key: str):
     now = int(time.time())
+    stale_fallback = None
     conn = _get_conn()
     try:
         row = conn.execute(
@@ -264,78 +308,146 @@ def get_cached_vexpay_rate(api_key: str):
         ).fetchone()
         if row and row["expires_at"] > now:
             return float(row["cache_value"])
+        row_last = conn.execute(
+            "SELECT cache_value, expires_at FROM kv_cache WHERE cache_key = 'vexpay_usd_rate_last_known'"
+        ).fetchone()
+        if row_last and row_last["expires_at"] > now:
+            stale_fallback = float(row_last["cache_value"])
     finally:
         conn.close()
 
-    if not api_key:
-        return None
-    try:
-        resp = requests.get(
-            f"{VEXPAY_BASE_URL}/v1/quote?usdAmount=1",
-            headers={"x-api-key": api_key, "Content-Type": "application/json"},
-            timeout=15
-        )
-        if resp.status_code == 200:
-            body = resp.json()
-            nested = body.get("data") if isinstance(body.get("data"), dict) else body
-            rate = nested.get("rate") or nested.get("vesAmount") or nested.get("bcvRate")
-            parsed_rate = parse_positive_float(rate, min_val=1.0)
-            if parsed_rate:
-                conn = _get_conn()
-                try:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO kv_cache (cache_key, cache_value, expires_at) VALUES (?, ?, ?)",
-                        ("vexpay_usd_rate", str(parsed_rate), now + 600)
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-                return parsed_rate
-    except Exception:
-        logger.warning("No se pudo refrescar tasa cacheada de VexPay")
-    return None
+    if api_key:
+        try:
+            resp = requests.get(
+                f"{VEXPAY_BASE_URL}/v1/quote?usdAmount=1",
+                headers={"x-api-key": api_key, "Content-Type": "application/json"},
+                timeout=15
+            )
+            if resp.status_code == 200:
+                body = resp.json()
+                nested = body.get("data") if isinstance(body.get("data"), dict) else body
+                rate = nested.get("rate") or nested.get("vesAmount") or nested.get("bcvRate")
+                parsed_rate = parse_positive_float(rate, min_val=1.0)
+                if parsed_rate:
+                    conn = _get_conn()
+                    try:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO kv_cache (cache_key, cache_value, expires_at) VALUES (?, ?, ?)",
+                            ("vexpay_usd_rate", str(parsed_rate), now + 600)
+                        )
+                        conn.execute(
+                            "INSERT OR REPLACE INTO kv_cache (cache_key, cache_value, expires_at) VALUES (?, ?, ?)",
+                            ("vexpay_usd_rate_last_known", str(parsed_rate), now + 86400)
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    return parsed_rate
+        except Exception:
+            logger.warning("No se pudo refrescar tasa cacheada de VexPay; usando respaldo")
+
+    if stale_fallback is not None:
+        return stale_fallback
+
+    env_fallback = parse_positive_float(os.getenv("MIN_VES_FALLBACK_RATE"), min_val=1.0)
+    return env_fallback
 
 
 def validate_min_ves_for_one_usd(ves_amount: float, api_key: str):
+    """AG2-B6: Validacion fail-closed del minimo $1.00 USD en Bs."""
     rate = get_cached_vexpay_rate(api_key)
     if rate is None:
-        return True, None
-    # Tolerancia del 3% para diferencias mínimas de redondeo entre cambios de tasa BCV
+        return False, "No se pudo verificar la tasa oficial mínima en este momento. Intenta en unos segundos.", 503
     min_ves = round(rate * 0.97, 2)
     if ves_amount < min_ves:
-        return False, f"El monto mínimo bancario es $1.00 USD (aprox. Bs. {rate:.2f})."
-    return True, None
+        return False, f"El monto mínimo bancario es $1.00 USD (aprox. Bs. {rate:.2f}).", 400
+    return True, None, 200
 
 
-def is_bank_reference_consumed(canonical_ref: str, current_external_ref: str):
+def reserve_bank_reference_inflight(raw_ref: str, canonical_ref: str, suffix6: str,
+                                    game: str, external_ref: str, ttl_seconds: int = 60):
+    """Reserva atomica pre-VexPay (BEGIN IMMEDIATE) para cerrar carreras TOCTOU + sufijo-6."""
+    now = int(time.time())
+    lock_key = suffix6 or canonical_ref
     conn = _get_conn()
     try:
-        row = conn.execute(
-            "SELECT external_ref, game FROM consumed_bank_references WHERE normalized_ref = ?",
-            (canonical_ref,)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM inflight_bank_references WHERE expires_at <= ?", (now,))
+
+        if suffix6:
+            consumed = conn.execute(
+                """
+                SELECT external_ref, game FROM consumed_bank_references
+                WHERE normalized_ref = ? OR (suffix6 != '' AND suffix6 = ?)
+                LIMIT 1
+                """,
+                (canonical_ref, suffix6)
+            ).fetchone()
+        else:
+            consumed = conn.execute(
+                "SELECT external_ref, game FROM consumed_bank_references WHERE normalized_ref = ? LIMIT 1",
+                (canonical_ref,)
+            ).fetchone()
+
+        if consumed and (not external_ref or consumed["external_ref"] != external_ref):
+            conn.commit()
+            return False, "consumed", dict(consumed)
+
+        inflight = conn.execute(
+            "SELECT external_ref, game FROM inflight_bank_references WHERE lock_key = ? LIMIT 1",
+            (lock_key,)
         ).fetchone()
-        if not row:
-            return False, None
-        # Idempotencia: si es exactamente la misma operación, no es replay cruzado
-        if current_external_ref and row["external_ref"] == current_external_ref:
-            return False, None
-        return True, dict(row)
+        if inflight and (not external_ref or inflight["external_ref"] != external_ref):
+            conn.commit()
+            return False, "inflight", dict(inflight)
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO inflight_bank_references (lock_key, external_ref, game, expires_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (lock_key, str(external_ref or ""), game, now + ttl_seconds)
+        )
+        conn.commit()
+        return True, "reserved", None
     finally:
         conn.close()
 
 
-def record_consumed_bank_reference(raw_ref: str, canonical_ref: str, game: str, external_ref: str, method: str, amount_usd=None):
-    if not canonical_ref:
+def release_bank_reference_inflight(canonical_ref: str, suffix6: str, external_ref: str):
+    lock_key = suffix6 or canonical_ref
+    if not lock_key:
         return
     conn = _get_conn()
     try:
         conn.execute(
+            "DELETE FROM inflight_bank_references WHERE lock_key = ? AND external_ref = ?",
+            (lock_key, str(external_ref or ""))
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_consumed_bank_reference(raw_ref: str, canonical_ref: str, suffix6: str,
+                                   game: str, external_ref: str, method: str, amount_usd=None):
+    if not canonical_ref:
+        return
+    lock_key = suffix6 or canonical_ref
+    conn = _get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
             """
             INSERT OR IGNORE INTO consumed_bank_references
-            (normalized_ref, raw_reference, game, external_ref, method, amount_usd, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (normalized_ref, raw_reference, suffix6, game, external_ref, method, amount_usd, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (canonical_ref, str(raw_ref), game, str(external_ref or ""), method, amount_usd, int(time.time()))
+            (canonical_ref, str(raw_ref), str(suffix6 or ""), game, str(external_ref or ""), method, amount_usd, int(time.time()))
+        )
+        conn.execute(
+            "DELETE FROM inflight_bank_references WHERE lock_key = ?",
+            (lock_key,)
         )
         conn.commit()
     finally:
@@ -345,15 +457,28 @@ def record_consumed_bank_reference(raw_ref: str, canonical_ref: str, game: str, 
 def save_webhook_event(external_ref: str, game: str, event_type: str, status: str,
                        payment_id=None, bank_reference=None, method=None,
                        usd_amount=None, ves_amount=None, reason=None):
+    """AG2-C8: Nunca degrada un estado COMPLETED/APPROVED ya persistido."""
     if not external_ref:
         return
     conn = _get_conn()
     try:
         conn.execute(
             """
-            INSERT OR REPLACE INTO vexpay_webhooks
+            INSERT INTO vexpay_webhooks
             (external_ref, game, event_type, status, payment_id, bank_reference, method, usd_amount, ves_amount, reason, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(external_ref) DO UPDATE SET
+                game = excluded.game,
+                event_type = excluded.event_type,
+                status = excluded.status,
+                payment_id = COALESCE(NULLIF(excluded.payment_id, ''), vexpay_webhooks.payment_id),
+                bank_reference = COALESCE(NULLIF(excluded.bank_reference, ''), vexpay_webhooks.bank_reference),
+                method = COALESCE(NULLIF(excluded.method, ''), vexpay_webhooks.method),
+                usd_amount = COALESCE(excluded.usd_amount, vexpay_webhooks.usd_amount),
+                ves_amount = COALESCE(excluded.ves_amount, vexpay_webhooks.ves_amount),
+                reason = excluded.reason,
+                updated_at = excluded.updated_at
+            WHERE vexpay_webhooks.status NOT IN ('COMPLETED', 'DONE', 'APPROVED', 'SUCCESS', 'VERIFIED')
             """,
             (
                 str(external_ref).strip(),
@@ -379,12 +504,20 @@ def get_webhook_status(external_ref: str, expected_game: str = None):
     try:
         if expected_game:
             row = conn.execute(
-                "SELECT * FROM vexpay_webhooks WHERE external_ref = ? AND game = ?",
+                """
+                SELECT external_ref, game, status, bank_reference, method, updated_at
+                FROM vexpay_webhooks
+                WHERE external_ref = ? AND game = ?
+                """,
                 (external_ref.strip(), expected_game)
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT * FROM vexpay_webhooks WHERE external_ref = ?",
+                """
+                SELECT external_ref, game, status, bank_reference, method, updated_at
+                FROM vexpay_webhooks
+                WHERE external_ref = ?
+                """,
                 (external_ref.strip(),)
             ).fetchone()
         return dict(row) if row else None
@@ -392,8 +525,8 @@ def get_webhook_status(external_ref: str, expected_game: str = None):
         conn.close()
 
 
-# --- GESTIÓN DE OTP DE CORREO EN BD (MULTI-WORKER + TTL + MÁX. 5 INTENTOS) ---
-OTP_TTL_SECONDS = 600  # 10 minutos
+# --- GESTION DE OTP DE CORREO EN BD (MULTI-WORKER + TTL + MAX. 5 INTENTOS) ---
+OTP_TTL_SECONDS = 600
 OTP_MAX_ATTEMPTS = 5
 
 
