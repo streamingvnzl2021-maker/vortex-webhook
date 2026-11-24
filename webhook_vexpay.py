@@ -29,7 +29,7 @@ SIGNATURE_HEADERS = (
 
 
 def extract_vexpay_fields(raw_json):
-    """Extrae campos desde payload/data/payment o raíz, alineado al JSON real de VexPay."""
+    """Extrae campos desde payload/data/payment o raiz, alineado al JSON real de VexPay."""
     nested = raw_json.get("payload") or raw_json.get("data") or raw_json.get("payment") or {}
     if not isinstance(nested, dict):
         nested = {}
@@ -87,7 +87,6 @@ def _verify_hmac_signature(raw_body: bytes, secret: str) -> bool:
     if not sig_header:
         return False
 
-    # Formato Stripe-style: t=12345,v1=abcdef...
     if "v1=" in sig_header:
         parts = {}
         for item in sig_header.split(","):
@@ -110,7 +109,7 @@ def _verify_hmac_signature(raw_body: bytes, secret: str) -> bool:
 
 
 def _verify_payment_against_vexpay(api_key: str, payment_id: str, expected_ref: str):
-    """Confirma activamente contra la API de VexPay que el pago realmente existe y coincide."""
+    """Confirma activamente contra la API de VexPay que el pago existe y esta COMPLETED (fail-closed)."""
     if not payment_id:
         return "missing_id"
     try:
@@ -119,8 +118,6 @@ def _verify_payment_against_vexpay(api_key: str, payment_id: str, expected_ref: 
             headers={"x-api-key": api_key, "Content-Type": "application/json"},
             timeout=15
         )
-        if resp.status_code in (404, 405):
-            return "endpoint_unavailable"
         if resp.status_code != 200:
             return "rejected"
         body = resp.json()
@@ -129,43 +126,41 @@ def _verify_payment_against_vexpay(api_key: str, payment_id: str, expected_ref: 
             return "rejected"
         remote_ref = str(nested.get("externalRef") or "").strip()
         remote_status = str(nested.get("status") or "").strip().upper()
-        if remote_ref and expected_ref and remote_ref != expected_ref:
+        if not remote_ref or remote_ref != expected_ref:
             return "rejected"
-        if remote_status and remote_status not in APPROVED_STATUSES:
+        if remote_status not in APPROVED_STATUSES:
             return "rejected"
         return "verified"
     except Exception:
-        return "endpoint_unavailable"
+        return "rejected"
 
 
 def _authenticate_webhook(raw_body: bytes, fields: dict, api_key: str, webhook_secret: str):
     if not api_key:
-        return False, 500, "API Key no configurada en Render"
+        return False, 500, "API Key no configurada en Render", "none"
 
-    # 1. Si se configuró VEXPAY_WEBHOOK_SECRET en Render: HMAC obligatorio (fail-closed absoluto)
+    # 1. HMAC obligatorio si se configuro VEXPAY_WEBHOOK_SECRET
     if webhook_secret:
         if _verify_hmac_signature(raw_body, webhook_secret):
-            return True, 200, "ok"
-        return False, 401, "Firma criptográfica HMAC inválida o ausente"
+            return True, 200, "ok", "hmac"
+        return False, 401, "Firma criptográfica HMAC inválida o ausente", "none"
 
-    # 2. Si el llamador envía x-api-key: validación fail-closed con compare_digest
+    # 2. Validacion fail-closed si el llamador envia x-api-key
     received_key = request.headers.get("x-api-key", "").strip()
     if received_key:
         if hmac.compare_digest(received_key, api_key):
-            return True, 200, "ok"
-        return False, 401, "API Key inválida"
+            return True, 200, "ok", "api_key"
+        return False, 401, "API Key inválida", "none"
 
-    # 3. Modo transición seguro mientras no exista VEXPAY_WEBHOOK_SECRET:
-    # Exige platformId oficial de Vortex Play y verificación activa contra VexPay para payment.completed
+    # 3. Modo transicion fail-closed: exige platformId y verificacion activa estricta contra VexPay
     if not fields["platform_id"] or not hmac.compare_digest(fields["platform_id"], VEXPAY_PLATFORM_ID):
-        return False, 401, "Solicitud de webhook no autenticada"
+        return False, 401, "Solicitud de webhook no autenticada", "none"
 
-    # Registra únicamente los nombres de cabeceras (sin valores) para diagnóstico de firma VexPay
     sig_keys = [k for k in request.headers.keys() if "vex" in k.lower() or "sig" in k.lower()]
     if sig_keys:
         logger.info("[WEBHOOK] Cabeceras de firma detectadas (solo nombres): %s", sig_keys)
 
-    return True, 200, "ok"
+    return True, 200, "ok", "platform_transition"
 
 
 def _handle_webhook(game: str, api_key: str, webhook_secret: str):
@@ -176,11 +171,10 @@ def _handle_webhook(game: str, api_key: str, webhook_secret: str):
 
     fields = extract_vexpay_fields(raw_json)
 
-    # Ignora eventos de notificación de prueba o retiros propios del comercio (payout.*)
     if fields["event_type"].startswith("payout.") or fields["event_type"] == "notification.test":
         return jsonify({"status": "ignored", "message": "Evento administrativo no aplicable a jugadas"}), 200
 
-    authed, code, err_msg = _authenticate_webhook(raw_body, fields, api_key, webhook_secret)
+    authed, code, err_msg, auth_mode = _authenticate_webhook(raw_body, fields, api_key, webhook_secret)
     if not authed:
         logger.warning("[WEBHOOK %s] Rechazado (%s): %s", game.upper(), code, err_msg)
         return jsonify({"status": "unauthorized" if code == 401 else "error", "message": err_msg}), code
@@ -197,12 +191,16 @@ def _handle_webhook(game: str, api_key: str, webhook_secret: str):
 
     is_completed = fields["status"] in APPROVED_STATUSES or fields["event_type"] == "payment.completed"
 
-    # Doble candado para payment.completed si todavía no hay VEXPAY_WEBHOOK_SECRET configurado
-    if is_completed and not webhook_secret:
-        check = _verify_payment_against_vexpay(api_key, fields["payment_id"], external_ref)
-        if check == "rejected":
-            logger.warning("[WEBHOOK %s] Pago %s rechazado en verificación activa", game.upper(), external_ref)
-            return jsonify({"status": "unauthorized", "message": "No se pudo verificar el pago contra VexPay"}), 401
+    # AG2-C8: Fail-closed absoluto en modo transicion (sin VEXPAY_WEBHOOK_SECRET)
+    if auth_mode == "platform_transition":
+        if is_completed:
+            check = _verify_payment_against_vexpay(api_key, fields["payment_id"], external_ref)
+            if check != "verified":
+                logger.warning("[WEBHOOK %s] Pago %s bloqueado (verificacion=%s)", game.upper(), external_ref, check)
+                return jsonify({"status": "unauthorized", "message": "Pago no verificado contra VexPay"}), 401
+        else:
+            # Sin HMAC/API-Key no persistimos eventos no-completados para evitar envenenar estados
+            return jsonify({"status": "acknowledged", "event": fields["event_type"], "externalRef": external_ref}), 200
 
     save_webhook_event(
         external_ref=external_ref,
@@ -218,10 +216,10 @@ def _handle_webhook(game: str, api_key: str, webhook_secret: str):
     )
 
     if is_completed and fields["bank_reference"]:
-        raw_r, canon_r = normalize_bank_reference(fields["bank_reference"])
+        raw_r, canon_r, suf6 = normalize_bank_reference(fields["bank_reference"])
         if canon_r:
             record_consumed_bank_reference(
-                raw_r, canon_r, game, external_ref,
+                raw_r, canon_r, suf6, game, external_ref,
                 fields["method"] or "WEBHOOK", fields["usd_amount"]
             )
 
