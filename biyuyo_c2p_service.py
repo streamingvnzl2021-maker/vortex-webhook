@@ -6,10 +6,10 @@ from dotenv import load_dotenv
 from backend_core import (
     VEXPAY_BASE_URL,
     check_rate_limit,
+    extract_bank_reference_from_response,
     get_client_ip,
     get_venezuela_time_payload,
     get_webhook_status,
-    is_bank_reference_consumed,
     is_vexpay_approved,
     normalize_bank_reference,
     normalize_doc_id,
@@ -18,6 +18,8 @@ from backend_core import (
     parse_positive_float,
     parse_vexpay_response,
     record_consumed_bank_reference,
+    release_bank_reference_inflight,
+    reserve_bank_reference_inflight,
     validate_bank_otp,
     validate_min_ves_for_one_usd,
 )
@@ -42,7 +44,7 @@ def _is_valid_biyuyo_ref(external_ref) -> bool:
     return (ref.startswith("BYX-") or ref.startswith("RES-BYX-")) and len(ref) <= 80
 
 
-# RUTA 1: Crear intención C2P (Biyuyo Express)
+# RUTA 1: Crear intencion C2P (Biyuyo Express)
 @biyuyo_c2p_bp.route('/api/c2p/request', methods=['POST'])
 def biyuyo_solicitar_intencion():
     headers, api_key = get_biyuyo_headers()
@@ -62,9 +64,9 @@ def biyuyo_solicitar_intencion():
     ves_amount = parse_positive_float(datos.get("vesAmount"))
     if ves_amount is None:
         return jsonify({"status": "error", "message": "Monto en Bolívares inválido"}), 400
-    min_ok, min_msg = validate_min_ves_for_one_usd(ves_amount, api_key)
+    min_ok, min_msg, min_code = validate_min_ves_for_one_usd(ves_amount, api_key)
     if not min_ok:
-        return jsonify({"status": "error", "message": min_msg}), 400
+        return jsonify({"status": "error", "message": min_msg}), min_code
 
     phone_formatted = normalize_ve_phone(datos.get("debtorCellPhone"))
     if not phone_formatted:
@@ -96,7 +98,7 @@ def biyuyo_solicitar_intencion():
         return jsonify({"status": "error", "message": "Error temporal de conexión con la pasarela Biyuyo"}), 502
 
 
-# RUTA 2: Ejecutar cobro C2P con Token OTP (Biyuyo Express — timeout=45s + HTTP 504/502)
+# RUTA 2: Ejecutar cobro C2P con Token OTP (Biyuyo Express)
 @biyuyo_c2p_bp.route('/api/c2p/execute', methods=['POST'])
 def biyuyo_ejecutar_cobro():
     headers, api_key = get_biyuyo_headers()
@@ -117,9 +119,9 @@ def biyuyo_ejecutar_cobro():
     ves_amount = parse_positive_float(datos.get("vesAmount"))
     if ves_amount is None:
         return jsonify({"status": "error", "message": "Monto en Bolívares inválido"}), 400
-    min_ok, min_msg = validate_min_ves_for_one_usd(ves_amount, api_key)
+    min_ok, min_msg, min_code = validate_min_ves_for_one_usd(ves_amount, api_key)
     if not min_ok:
-        return jsonify({"status": "error", "message": min_msg}), 400
+        return jsonify({"status": "error", "message": min_msg}), min_code
 
     phone_formatted = normalize_ve_phone(datos.get("debtorCellPhone"))
     if not phone_formatted:
@@ -153,12 +155,11 @@ def biyuyo_ejecutar_cobro():
         try:
             body = response.json()
             if is_vexpay_approved(body, response.status_code):
-                nested = body.get("data") if isinstance(body.get("data"), dict) else body
-                bank_ref = nested.get("bankReference") or nested.get("reference")
+                bank_ref = extract_bank_reference_from_response(body)
                 if bank_ref:
-                    raw_r, canon_r = normalize_bank_reference(bank_ref)
+                    raw_r, canon_r, suf6 = normalize_bank_reference(bank_ref)
                     if canon_r:
-                        record_consumed_bank_reference(raw_r, canon_r, "biyuyo", external_ref, "C2P")
+                        record_consumed_bank_reference(raw_r, canon_r, suf6, "biyuyo", external_ref, "C2P")
         except ValueError:
             pass
         return parse_vexpay_response(response)
@@ -168,7 +169,7 @@ def biyuyo_ejecutar_cobro():
         return jsonify({"status": "error", "message": "Error temporal de conexión con la pasarela Biyuyo"}), 502
 
 
-# RUTA 3: Cuenta receptora Pago Móvil (Biyuyo Express)
+# RUTA 3: Cuenta receptora Pago Movil (Biyuyo Express)
 @biyuyo_c2p_bp.route('/api/pago-movil/account', methods=['GET'])
 def biyuyo_obtener_cuenta_pago_movil():
     headers, _ = get_biyuyo_headers()
@@ -185,7 +186,7 @@ def biyuyo_obtener_cuenta_pago_movil():
         return jsonify({"status": "error", "message": "Error al obtener cuenta receptora Biyuyo"}), 502
 
 
-# RUTA 4: Verificar Pago Móvil (Biyuyo Express) + Anti-Replay Servidor
+# RUTA 4: Verificar Pago Movil (Biyuyo Express) + Anti-Replay Atomico
 @biyuyo_c2p_bp.route('/api/pago-movil/verify', methods=['POST'])
 def biyuyo_verificar_pago_movil():
     headers, _ = get_biyuyo_headers()
@@ -206,12 +207,20 @@ def biyuyo_verificar_pago_movil():
     if usd_amount is None:
         return jsonify({"status": "error", "message": "El monto mínimo para Pago Móvil es $1.00 USD"}), 400
 
-    raw_ref, canonical_ref = normalize_bank_reference(datos.get("reference"))
+    raw_ref, canonical_ref, suffix6 = normalize_bank_reference(datos.get("reference"))
     if not raw_ref:
         return jsonify({"status": "error", "message": "La referencia bancaria debe tener entre 6 y 12 dígitos numéricos"}), 400
 
-    already_used, prev = is_bank_reference_consumed(canonical_ref, external_ref)
-    if already_used:
+    reserved, state, prev = reserve_bank_reference_inflight(
+        raw_ref, canonical_ref, suffix6, "biyuyo", external_ref, ttl_seconds=60
+    )
+    if not reserved:
+        if state == "inflight":
+            return jsonify({
+                "status": "error",
+                "code": "REFERENCE_IN_FLIGHT",
+                "message": "Esta referencia bancaria ya se está verificando en este instante. Espera unos segundos."
+            }), 409
         return jsonify({
             "status": "error",
             "code": "REPLAY_ATTACK",
@@ -227,12 +236,14 @@ def biyuyo_verificar_pago_movil():
         payload["dateMovement"] = str(datos.get("dateMovement")).strip()[:20]
 
     url = f"{VEXPAY_BASE_URL}/v1/payments/pago-movil/verify"
+    approved = False
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=45)
         try:
             body = response.json()
             if is_vexpay_approved(body, response.status_code):
-                record_consumed_bank_reference(raw_ref, canonical_ref, "biyuyo", external_ref, "PAGO_MOVIL", usd_amount)
+                approved = True
+                record_consumed_bank_reference(raw_ref, canonical_ref, suffix6, "biyuyo", external_ref, "PAGO_MOVIL", usd_amount)
         except ValueError:
             pass
         return parse_vexpay_response(response)
@@ -240,6 +251,9 @@ def biyuyo_verificar_pago_movil():
         return jsonify({"status": "error", "message": "Tiempo de espera agotado verificando Pago Móvil Biyuyo (45s)"}), 504
     except requests.RequestException:
         return jsonify({"status": "error", "message": "Error temporal de conexión con la pasarela Biyuyo"}), 502
+    finally:
+        if not approved:
+            release_bank_reference_inflight(canonical_ref, suffix6, external_ref)
 
 
 # RUTA 5: Tasa oficial BCV/VexPay (Biyuyo Express)
@@ -259,9 +273,14 @@ def biyuyo_obtener_tasa_vexpay():
         return jsonify({"status": "error", "message": "Error al obtener tasa de VexPay Biyuyo"}), 502
 
 
-# RUTA 6: Conciliación post-F5 de pagos Biyuyo registrados por webhook
+# RUTA 6: Conciliacion post-F5 de pagos Biyuyo (con rate-limit y payload minimo)
 @biyuyo_c2p_bp.route('/api/c2p/status/<external_ref>', methods=['GET'])
 def consultar_estado_biyuyo(external_ref):
+    ip = get_client_ip(request)
+    ok_rl, retry_after = check_rate_limit(f"byx_status:{ip}", max_hits=30, window_seconds=60)
+    if not ok_rl:
+        return jsonify({"status": "error", "message": f"Demasiadas consultas. Espera {retry_after}s."}), 429
+
     clean_ref = str(external_ref or "").strip()
     if not _is_valid_biyuyo_ref(clean_ref):
         return jsonify({"status": "error", "message": "Referencia de Biyuyo inválida"}), 400
@@ -271,7 +290,7 @@ def consultar_estado_biyuyo(external_ref):
     return jsonify({"status": "ok", "data": record}), 200
 
 
-# RUTA 7: Reloj oficial Venezuela (UTC-4) bajo el prefijo /biyuyo
+# RUTA 7: Reloj oficial Venezuela (UTC-4)
 @biyuyo_c2p_bp.route('/api/time', methods=['GET'])
 def biyuyo_server_time():
     return jsonify(get_venezuela_time_payload()), 200
